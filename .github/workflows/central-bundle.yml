@@ -1,0 +1,49 @@
+name: Build Maven Central bundle
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Java 17 and 25
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: |
+            17
+            25
+          cache: gradle
+
+      - name: Build and test
+        run: bash ./gradlew --no-daemon "-Dorg.gradle.java.installations.paths=$JAVA_HOME_17_X64,$JAVA_HOME_25_X64" clean build testJava25 compileExamplesJava
+
+      - name: Sign and package
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          if [[ -z "$SIGNING_KEY" ]]; then
+            echo "::error::Add the SIGNING_KEY repository secret (ASCII-armored PGP private key)."
+            exit 1
+          fi
+          bash ./gradlew --no-daemon centralBundle
+          unzip -t build/central-bundle/*-central.zip
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: build/central-bundle/*-central.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
