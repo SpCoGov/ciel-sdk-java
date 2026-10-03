@@ -1,0 +1,46 @@
+name: Set up CIEL signing key
+
+"on":
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+    steps:
+      - name: Generate password-protected signing key
+        id: key
+        run: |
+          set -euo pipefail
+          test -n "$SIGNING_PASSWORD"
+          umask 077
+          export GNUPGHOME="$RUNNER_TEMP/ciel-signing"
+          export_dir="$RUNNER_TEMP/ciel-signing-export"
+          mkdir -m 700 -p "$GNUPGHOME" "$export_dir"
+          printf '%s\n' "$SIGNING_PASSWORD" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 --quick-generate-key "SpongeCouna <89863236+SpCoGov@users.noreply.github.com>" rsa3072 sign 2y
+          fingerprint="$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
+          test -n "$fingerprint"
+          printf '%s\n' "$fingerprint" > "$export_dir/fingerprint.txt"
+          gpg --batch --armor --export "$fingerprint" > "$export_dir/public-key.asc"
+          printf '%s\n' "$SIGNING_PASSWORD" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 --armor --export-secret-keys "$fingerprint" > "$export_dir/signing-key.asc"
+          printf 'fingerprint=%s\n' "$fingerprint" >> "$GITHUB_OUTPUT"
+
+      - name: Transfer encrypted key and public certificate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ciel-signing-key-setup
+          path: ${{ runner.temp }}/ciel-signing-export/
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Publish public key
+        env:
+          SIGNING_FINGERPRINT: ${{ steps.key.outputs.fingerprint }}
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/ciel-signing"
+          timeout 60 gpg --batch --keyserver hkps://keyserver.ubuntu.com --send-keys "$SIGNING_FINGERPRINT"
