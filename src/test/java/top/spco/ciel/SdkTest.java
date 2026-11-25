@@ -32,6 +32,18 @@ class SdkTest {
         assertThrows(CielException.class, () -> Protocol.payload(new JsonPrimitive(Double.NaN)));
         assertThrows(CielException.class, () -> Protocol.payload(new JsonPrimitive("\ud800")));
         assertThrows(CielException.class, () -> Protocol.text("\udc00", 100, false));
+        assertThrows(CielException.class, () -> Protocol.noControlText("QQ\nBot", 128, true));
+        assertThrows(CielException.class, () -> Protocol.noControlText("QQ\u007f", 128, false));
+        assertThrows(CielException.class, () -> Protocol.noControlText("   ", 128, true));
+        assertEquals("", Protocol.noControlText("", 128, false));
+        assertEquals("QQ 号", Protocol.noControlText("QQ 号", 128, true));
+        assertEquals(new CielClient.NotifierResult(true, null), CielClient.NotifierResult.delivered());
+        assertEquals(new CielClient.NotifierResult(false, null), CielClient.NotifierResult.failed());
+        assertEquals("EXTERNAL_TIMEOUT", CielClient.NotifierResult.failed("EXTERNAL_TIMEOUT").errorCode());
+        assertThrows(CielException.class, () -> new CielClient.NotifierResult(true, "EXTERNAL_TIMEOUT"));
+        assertThrows(CielException.class, () -> CielClient.NotifierResult.failed("BAD\nCODE"));
+        assertThrows(CielException.class, () -> CielClient.NotifierResult.failed(" "));
+        assertThrows(CielException.class, () -> CielClient.NotifierResult.failed("X".repeat(65)));
         assertEquals(JsonNull.INSTANCE, Protocol.payload(null));
         for (String address : List.of("ws://localhost/ws/service", "wss://u:p@localhost/ws/service",
                 "wss://localhost/ws/service?token=x", "wss://localhost:0/ws/service", "wss://localhost/ws/service#x"))

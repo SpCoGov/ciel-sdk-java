@@ -11,12 +11,13 @@ import java.util.function.*;
 /**
  * 通过固定 SPKI Pin 的 TLS 1.3 WebSocket 接入 Ciel v1 的线程安全客户端。
  *
- * <p>先使用 {@link #enroll(Path, Path)} 注册身份，再创建客户端、安装监听器和命令处理函数，
- * 最后调用 {@link #connect()}。业务请求仅在 {@link State#READY} 时发送；客户端负责应用心跳
- * 和临时故障重连，但不会自动重放业务请求。实例使用完毕后必须调用 {@link #close()} 释放身份锁。
+ * <p>先使用 {@link #enroll(Path, Path)} 注册身份，再创建客户端、安装监听器、命令处理函数
+ * 与外部通知器处理函数，最后调用 {@link #connect()}。业务请求仅在 {@link State#READY} 时发送；
+ * 客户端负责应用心跳和临时故障重连，但不会自动重放业务请求。实例使用完毕后必须调用 {@link #close()}
+ * 释放身份锁。
  *
- * <p>事件 ID、命令 ID、通知类型和请求 ID 长度均为 3 至 64 个字符，只允许 ASCII 字母、数字、
- * 点、下划线和连字符。实例 ID、调用 ID、通知 ID 为 32 位小写十六进制字符串。
+ * <p>事件 ID、命令 ID、通知类型、外部通知器 ID 和请求 ID 长度均为 3 至 64 个字符，只允许 ASCII
+ * 字母、数字、点、下划线和连字符。实例 ID、调用 ID、通知 ID 为 32 位小写十六进制字符串。
  * 所有 JSON 大小限制以序列化后的 UTF-8 字节数计算：业务 JSON 不超过 2048 字节，
  * 完整发送消息不超过 4096 字节。
  *
@@ -25,8 +26,8 @@ import java.util.function.*;
  * 读取错误。取消 Future 只取消本地等待并尝试移除排队发送，不保证撤销已发送的操作。
  * 需要恢复命令或通知时，应在发送前保存请求 ID 和完整参数。
  *
- * <p>监听器由有界回调线程池分发，命令处理函数由独立的有界执行线程池运行；回调可能并发，
- * 应自行保护共享数据，并避免长期阻塞。关闭时的状态通知有同步执行的特殊规则，见
+ * <p>监听器由有界回调线程池分发，命令处理函数与外部通知器处理函数由各自独立的有界执行线程池运行；
+ * 回调可能并发，应自行保护共享数据，并避免长期阻塞。关闭时的状态通知有同步执行的特殊规则，见
  * {@link #onState(Consumer)}。
  *
  * @see CielException
@@ -276,6 +277,170 @@ public final class CielClient implements AutoCloseable {
         @Override public String toString() { return "CommandExecution[callId=" + callId + ", commandId=" + commandId + "]"; }
     }
 
+    /**
+     * 外部通知器处理函数返回的投递结果。
+     *
+     * <p>成功时 {@code errorCode} 必须为 {@code null}；失败时可传入 {@code null}
+     * （服务端归一为 {@code EXTERNAL_SEND_FAILED}）或受控机器错误码
+     * （如 {@code EXTERNAL_SEND_FAILED}、{@code EXTERNAL_TIMEOUT}、
+     * {@code EXTERNAL_RATE_LIMITED}、{@code EXTERNAL_TARGET_INVALID}、
+     * {@code EXTERNAL_AUTH_FAILED}、{@code EXTERNAL_REJECTED}）。
+     *
+     * @param success 是否投递成功；{@code true} 使服务端投递记录进入 {@code DELIVERED}，
+     *                {@code false} 进入 {@code FAILED}
+     * @param errorCode 失败时的可选受控错误码，非空时不含控制字符且最多 64 UTF-8 字节；
+     *                  {@code success} 为 {@code true} 时必须为 {@code null}
+     */
+    public record NotifierResult(boolean success, String errorCode) {
+        /**
+         * 校验外部通知投递结果并构造不可变对象。
+         *
+         * @param success 投递是否成功
+         * @param errorCode 失败时的可选错误码，成功时必须为 {@code null}
+         * @throws CielException 成功时仍传入非空错误码，或错误码为空白、含控制字符或超过 64 UTF-8 字节时
+         */
+        public NotifierResult {
+            if (success && errorCode != null) throw Protocol.input("INVALID_INPUT");
+            if (errorCode != null) Protocol.noControlText(errorCode, 64, true);
+        }
+        /**
+         * 构造表示外部通知投递成功的结果。
+         * @return 成功结果（{@code success=true, errorCode=null}）
+         */
+        public static NotifierResult delivered() { return new NotifierResult(true, null); }
+        /**
+         * 构造表示外部通知投递失败的默认结果（错误码由服务端归一为 {@code EXTERNAL_SEND_FAILED}）。
+         * @return 失败结果（{@code success=false, errorCode=null}）
+         */
+        public static NotifierResult failed() { return new NotifierResult(false, null); }
+        /**
+         * 构造带受控机器错误码的外部通知投递失败结果。
+         *
+         * @param errorCode 受控错误码，可为 {@code null}
+         * @return 失败结果
+         * @throws CielException 错误码为空白、含控制字符或超过 64 UTF-8 字节时
+         */
+        public static NotifierResult failed(String errorCode) { return new NotifierResult(false, errorCode); }
+        /**
+         * 生成结果说明。
+         * @return 包含成功标志和错误码的说明
+         */
+        @Override public String toString() { return "NotifierResult[success=" + success + ", errorCode=" + errorCode + "]"; }
+    }
+
+    /**
+     * 提供给本地外部通知器处理函数的单用户投递上下文，绑定收到投递请求时的鉴权连接。
+     *
+     * <p>处理函数通过返回 {@link CompletionStage} 的 {@link NotifierResult} 提交结果。
+     * 原连接失效或超过截止时间后，迟到结果不会在新连接提交，服务端也不会自动重放已派发投递；
+     * 这不保证停止外部渠道已发出的请求。{@link #toString()} 隐藏用户目标地址、标题与正文。
+     */
+    public final class NotifierDelivery {
+        private final Wire owner;
+        private final String deliveryId;
+        private final String notifierId;
+        private final String target;
+        private final String serviceId;
+        private final String notificationType;
+        private final String typeName;
+        private final String title;
+        private final String body;
+        private final long createdAt;
+        private final long deadline;
+        private final AtomicBoolean finished = new AtomicBoolean();
+
+        private NotifierDelivery(Wire owner, JsonObject value) {
+            this.owner = owner;
+            deliveryId = Protocol.id(Protocol.string(value, "delivery_id"));
+            notifierId = Protocol.id(Protocol.string(value, "notifier_id"));
+            target = Protocol.string(value, "target");
+            if (target.isBlank()) throw Protocol.bad();
+            serviceId = Protocol.string(value, "service_id");
+            if (serviceId.isBlank()) throw Protocol.bad();
+            notificationType = Protocol.id(Protocol.string(value, "notification_type"));
+            typeName = Protocol.string(value, "type_name");
+            title = Protocol.string(value, "title");
+            body = Protocol.string(value, "body");
+            createdAt = Protocol.integer(value, "created_at");
+            deadline = Protocol.integer(value, "deadline");
+        }
+        /**
+         * 读取本次投递的唯一标识。
+         * @return 正式投递为 32 位小写十六进制 ID，管理员连通性测试为 {@code test-} 前缀 ID
+         */
+        public String deliveryId() { return deliveryId; }
+        /**
+         * 读取目标外部通知器 ID。
+         * @return 负责本次投递的外部通知器 ID
+         */
+        public String notifierId() { return notifierId; }
+        /**
+         * 读取收件人在该外部渠道的目标地址（或管理员测试目标）；不包含 Ciel 内部用户标识。
+         * @return 非空白接收目标地址，应按用户隐私数据保护
+         */
+        public String target() { return target; }
+        /**
+         * 读取来源服务 ID。
+         * @return 服务 ID；定时任务通知为 {@code ciel:scheduler}，管理员测试为 {@code ciel:test}
+         */
+        public String serviceId() { return serviceId; }
+        /**
+         * 读取通知类型 ID。
+         * @return 通知类型 ID（定时任务为 {@code scheduled-task}，管理员测试为 {@code notifier.test}）
+         */
+        public String notificationType() { return notificationType; }
+        /**
+         * 读取通知类型的显示名称。
+         * @return 通知类型显示名称
+         */
+        public String typeName() { return typeName; }
+        /**
+         * 读取纯文本通知标题。
+         * @return 通知标题，应按业务数据保护
+         */
+        public String title() { return title; }
+        /**
+         * 读取纯文本通知正文。
+         * @return 通知正文，应按业务数据保护
+         */
+        public String body() { return body; }
+        /**
+         * 读取通知创建时间。
+         * @return 以服务器 Unix 秒时间戳转换的创建时间
+         * @throws DateTimeException 服务端时间戳超出 {@link Instant} 可表示的范围时
+         */
+        public Instant createdAt() { return Instant.ofEpochSecond(createdAt); }
+        /**
+         * 返回服务器指定的结果提交截止时间，不是对外部发送请求的取消指令。
+         * @return 以服务器 Unix 秒时间戳转换的截止时间
+         * @throws DateTimeException 服务端时间戳超出 {@link Instant} 可表示的范围时
+         */
+        public Instant deadline() { return Instant.ofEpochSecond(deadline); }
+
+        private void finish(NotifierResult result) {
+            if (!finished.compareAndSet(false, true)) return;
+            deliveries.remove(deliveryId, this);
+            if (wire != owner || state != State.READY || Instant.now().getEpochSecond() >= deadline) {
+                report(new CielException(CielException.Kind.CONNECTION, "DELIVERY_CONNECTION_LOST", null, deliveryId,
+                        CielException.SendStage.NOT_SENT, null));
+                return;
+            }
+            JsonObject request = Protocol.message("notifier_result");
+            request.addProperty("delivery_id", deliveryId);
+            request.addProperty("success", result.success());
+            if (!result.success() && result.errorCode() != null) request.addProperty("error_code", result.errorCode());
+            request(request, "notifier_result_ack", newRequestId(), deliveryId, owner)
+                    .exceptionally(error -> { report(Enrollment.unwrap(error)); return null; });
+        }
+        /**
+         * 生成脱敏投递上下文说明。
+         * @return 仅包含投递 ID、通知器 ID 和通知类型的说明，不包含目标地址、标题和正文
+         */
+        @Override public String toString() {
+            return "NotifierDelivery[deliveryId=" + deliveryId + ", notifierId=" + notifierId + ", notificationType=" + notificationType + "]";
+        }
+    }
+
     private static final System.Logger LOG = System.getLogger("top.spco.ciel");
     private static final int MAX_REQUESTS = 64;
     private final IdentityStore store;
@@ -285,10 +450,13 @@ public final class CielClient implements AutoCloseable {
     private final ExecutorService network = Executors.newFixedThreadPool(2, threads("io"));
     private final ThreadPoolExecutor callbacks = pool("callbacks", 2, 64);
     private final ThreadPoolExecutor handlers = pool("commands", 4, 16);
+    private final ThreadPoolExecutor notifierHandlers = pool("notifiers", 4, 16);
     private final Map<String, Pending> pending = new ConcurrentHashMap<>();
     private final Map<String, Consumer<JsonObject>> listeners = new ConcurrentHashMap<>();
     private final Map<String, Function<CommandExecution, ? extends CompletionStage<CommandResult>>> commands = new ConcurrentHashMap<>();
     private final Map<String, CommandExecution> executions = new ConcurrentHashMap<>();
+    private final Map<String, Function<NotifierDelivery, ? extends CompletionStage<NotifierResult>>> notifiers = new ConcurrentHashMap<>();
+    private final Map<String, NotifierDelivery> deliveries = new ConcurrentHashMap<>();
     private final Set<CompletableFuture<CommandCall>> waiters = ConcurrentHashMap.newKeySet();
     private final Semaphore requestSlots = new Semaphore(MAX_REQUESTS);
     private final Object lifecycle = new Object();
@@ -334,7 +502,7 @@ public final class CielClient implements AutoCloseable {
     /**
      * 使用指定配置加载已有身份并持有 {@code agent.lock}，尚不建立网络连接。
      *
-     * <p>可在调用 {@link #connect()} 前安装命令处理函数，以处理鉴权后立即到来的执行请求。
+     * <p>可在调用 {@link #connect()} 前安装命令和外部通知器处理函数，以处理鉴权后立即到来的执行或投递请求。
      * 同一身份目录不能同时由 Java 或 Rust 客户端使用；锁保持到 {@link #close()}。
      *
      * @param identityDirectory 已注册且含 {@code identity.json} 的身份目录
@@ -346,7 +514,7 @@ public final class CielClient implements AutoCloseable {
         this.options = Objects.requireNonNull(options, "options");
         store = new IdentityStore(Objects.requireNonNull(identityDirectory, "identityDirectory"), false);
         try { identity = store.load(); }
-        catch (RuntimeException error) { store.close(); network.shutdownNow(); callbacks.shutdownNow(); handlers.shutdownNow(); throw error; }
+        catch (RuntimeException error) { store.close(); network.shutdownNow(); callbacks.shutdownNow(); handlers.shutdownNow(); notifierHandlers.shutdownNow(); throw error; }
         clock = new ScheduledThreadPoolExecutor(1, threads("clock"));
         clock.setRemoveOnCancelPolicy(true);
     }
@@ -381,9 +549,9 @@ public final class CielClient implements AutoCloseable {
     /**
      * 使用默认配置创建客户端并等待首次鉴权成功。
      *
-     * <p>适用于无需预先安装命令处理函数的调用方。异步连接失败或 Future 被取消时自动关闭
-     * 客户端；成功后调用方负责关闭返回的实例。需要提供命令时，应使用构造器、
-     * {@link #onCommand(String, Function)} 和实例的 {@link #connect()}。
+     * <p>适用于无需预先安装命令或外部通知器处理函数的调用方。异步连接失败或 Future 被取消时自动关闭
+     * 客户端；成功后调用方负责关闭返回的实例。需要提供命令或外部通知器时，应使用构造器、
+     * {@link #onCommand(String, Function)} / {@link #onNotifier(String, Function)} 和实例的 {@link #connect()}。
      *
      * @param directory 已注册的身份目录
      * @return 首次进入 {@link State#READY} 时完成的客户端 Future；临时故障持续退避重试，
@@ -429,7 +597,7 @@ public final class CielClient implements AutoCloseable {
      */
     public CielClient onState(Consumer<State> listener) { stateListener = listener; return this; }
     /**
-     * 设置或替换连接、执行结果提交和回调失败的错误监听器。
+     * 设置或替换连接、命令/外部通知投递结果提交和回调失败的错误监听器。
      *
      * <p>通过回调线程池尽力分发，队列已满时只记录错误码。普通业务错误通过对应请求的
      * Future 返回，不保证另外触发此监听器。监听器异常不会中断接收循环。
@@ -491,6 +659,35 @@ public final class CielClient implements AutoCloseable {
     public CielClient onCommand(String commandId, Function<CommandExecution, ? extends CompletionStage<CommandResult>> handler) {
         commands.put(Protocol.id(commandId), Objects.requireNonNull(handler)); return this;
     }
+
+    /**
+     * 安装或替换本地外部通知器投递处理函数，不向服务器注册通知器。
+     *
+     * <p>应先安装处理函数，再连接和调用
+     * {@link #registerNotifier(String, String, String, String)}。
+     * 处理函数在独立线程池运行，必须返回非空的异步结果；抛出异常、异步失败或返回空值时，
+     * SDK 在原连接有效且未过期的条件下提交 {@code EXTERNAL_SEND_FAILED} 失败结果。
+     * 容量不足时提交 {@code EXTERNAL_RATE_LIMITED}。断线和截止时间不保证停止外部渠道已发出的请求。
+     *
+     * @param notifierId 外部通知器 ID，符合客户端的 ID 格式规则
+     * @param handler 非空处理函数，接收投递上下文并返回 {@link NotifierResult} 的完成阶段
+     * @return 当前客户端
+     * @throws CielException 通知器 ID 格式无效时
+     * @throws NullPointerException 处理函数为空时
+     * @see #removeNotifierHandler(String)
+     */
+    public CielClient onNotifier(String notifierId, Function<NotifierDelivery, ? extends CompletionStage<NotifierResult>> handler) {
+        notifiers.put(Protocol.id(notifierId), Objects.requireNonNull(handler)); return this;
+    }
+
+    /**
+     * 移除本地外部通知器投递处理函数；不注销服务器上的外部通知器定义。
+     *
+     * @param notifierId 要移除处理函数的外部通知器 ID
+     * @throws CielException 通知器 ID 格式无效时
+     * @see #unregisterNotifier(String)
+     */
+    public void removeNotifierHandler(String notifierId) { notifiers.remove(Protocol.id(notifierId)); }
 
     /**
      * 开始连接并等待首次进入 {@link State#READY}。
@@ -576,6 +773,7 @@ public final class CielClient implements AutoCloseable {
                     Consumer<CommandCall> listener = completionListener;
                     if (listener != null) dispatch(() -> listener.accept(call));
                 }
+                case "notifier_deliver" -> deliver(source, message);
                 case "error" -> {
                     CielException error = Protocol.serverError(message);
                     if (!message.has("request_id")) { lost(source, error); return; }
@@ -592,7 +790,8 @@ public final class CielClient implements AutoCloseable {
     private void response(Wire source, String type, JsonObject message) {
         if (!Set.of("event_registered", "event_unregistered", "event_subscribed", "event_unsubscribed", "event_published",
                 "command_registered", "command_unregistered", "command_accepted", "command_status", "command_result_ack",
-                "notification_registered", "notification_unregistered", "notification_result", "notification_status").contains(type)) throw Protocol.bad();
+                "notification_registered", "notification_unregistered", "notification_result", "notification_status",
+                "notifier_registered", "notifier_unregistered", "notifier_result_ack").contains(type)) throw Protocol.bad();
         String id = Protocol.id(Protocol.string(message, "request_id"));
         Pending request = pending.get(id);
         if (request == null || request.owner != source) return; // A known, late response to an expired request.
@@ -601,12 +800,17 @@ public final class CielClient implements AutoCloseable {
             case "event_registered", "event_unregistered", "event_subscribed", "event_unsubscribed", "event_published" -> "event_id";
             case "command_registered", "command_unregistered" -> "command_id";
             case "notification_registered", "notification_unregistered" -> "notification_type";
+            case "notifier_registered", "notifier_unregistered" -> "notifier_id";
             case "command_result_ack" -> "call_id";
+            case "notifier_result_ack" -> "delivery_id";
             default -> null;
         };
         if (field != null && !Protocol.string(message, field).equals(Protocol.string(request.request, field))) throw Protocol.bad();
         if (type.equals("event_published")) {
             Protocol.integer(message, "publication_id"); Protocol.integer(message, "subscriber_count"); Protocol.integer(message, "queued_count");
+        } else if (type.equals("notifier_result_ack")) {
+            String expectedStatus = request.request.get("success").getAsBoolean() ? "DELIVERED" : "FAILED";
+            if (!Protocol.string(message, "status").equals(expectedStatus)) throw Protocol.bad();
         } else if (type.equals("command_accepted") || type.equals("command_status")) {
             CommandCall call = new CommandCall(Protocol.object(message.get("call")));
             if (type.equals("command_accepted") && !call.requestId().equals(id)) throw Protocol.bad();
@@ -661,6 +865,8 @@ public final class CielClient implements AutoCloseable {
             awaitingHeartbeat = false;
             executions.values().forEach(execution -> execution.finished.set(true));
             executions.clear();
+            deliveries.values().forEach(delivery -> delivery.finished.set(true));
+            deliveries.clear();
             pending.forEach((id, request) -> request.result.completeExceptionally(error.forRequest(id, request.recordId, request.attempted.get())));
             waiters.forEach(waiter -> waiter.completeExceptionally(error));
             report(error);
@@ -1003,6 +1209,88 @@ public final class CielClient implements AutoCloseable {
                 response -> response.getAsJsonObject("notification"));
     }
 
+    /**
+     * 为当前实例注册或更新外部通知渠道（使用服务端默认目标标签），要求事先安装本地处理函数。
+     *
+     * @param notifierId 外部通知器 ID（全局唯一，单实例最多 32 个；{@code inbox} 与 {@code email} 为保留 ID）
+     * @param name 非空白且不含控制字符的显示名称，最多 128 UTF-8 字节
+     * @param description 非空引用的描述字符串，可为空串，最多 1024 UTF-8 字节
+     * @return 含 {@code notifier_id} 和 {@code request_id} 的 {@code notifier_registered} 确认封包 Future
+     * @throws CielException ID 或文本无效、消息过大或缺少本地处理函数时
+     * @see #registerNotifier(String, String, String, String)
+     * @see #onNotifier(String, Function)
+     */
+    public CompletableFuture<JsonObject> registerNotifier(String notifierId, String name, String description) {
+        return registerNotifier(notifierId, name, description, null);
+    }
+
+    /**
+     * 为当前实例注册或更新外部通知渠道，要求事先安装相应本地处理函数。
+     *
+     * <p>外部通知器定义由服务器持久保存；新注册的渠道默认停用，需由管理员启用后才会向其派发真实用户通知。
+     * 重复注册仅更新名称、描述和目标标签，不会重置管理员启停状态，也不会清除用户已保存的目标地址或渠道偏好。
+     *
+     * @param notifierId 外部通知器 ID（全局唯一，单实例最多 32 个；{@code inbox} 与 {@code email} 为保留 ID）
+     * @param name 非空白且不含控制字符的显示名称，最多 128 UTF-8 字节
+     * @param description 非空引用的描述字符串，可为空串，最多 1024 UTF-8 字节
+     * @param targetLabel 可选的目标地址表单标签（如 {@code "QQ 号"}），为 {@code null} 或空白时服务端使用默认值；
+     *                    非 {@code null} 时不含控制字符且最多 128 UTF-8 字节
+     * @return 含 {@code notifier_id} 和 {@code request_id} 的 {@code notifier_registered} 确认封包 Future
+     * @throws CielException ID 或文本无效、消息过大或缺少本地处理函数时
+     * @see #onNotifier(String, Function)
+     */
+    public CompletableFuture<JsonObject> registerNotifier(String notifierId, String name, String description, String targetLabel) {
+        Protocol.id(notifierId);
+        if (!notifiers.containsKey(notifierId)) throw Protocol.input("NOTIFIER_HANDLER_REQUIRED");
+        JsonObject request = Protocol.message("notifier_register");
+        request.addProperty("notifier_id", notifierId);
+        request.addProperty("name", Protocol.noControlText(name, 128, true));
+        request.addProperty("description", Protocol.text(description, 1024, false));
+        if (targetLabel != null) request.addProperty("target_label", Protocol.noControlText(targetLabel, 128, false));
+        return request(request, "notifier_registered", newRequestId(), null, null);
+    }
+
+    /**
+     * 注销当前实例拥有的外部通知渠道，并在收到成功确认后移除对应本地处理函数。
+     *
+     * <p>注销不存在的自身渠道幂等成功，保留历史投递快照和用户偏好；失败时保留本地处理函数。
+     *
+     * @param notifierId 外部通知器 ID
+     * @return 含 {@code notifier_id} 和 {@code request_id} 的 {@code notifier_unregistered} 确认封包 Future
+     * @throws CielException 通知器 ID 格式无效时
+     */
+    public CompletableFuture<JsonObject> unregisterNotifier(String notifierId) {
+        JsonObject request = Protocol.message("notifier_unregister");
+        request.addProperty("notifier_id", Protocol.id(notifierId));
+        return map(request(request, "notifier_unregistered", newRequestId(), null, null), response -> {
+            notifiers.remove(notifierId); return response;
+        });
+    }
+
+    private void deliver(Wire source, JsonObject message) {
+        NotifierDelivery delivery = new NotifierDelivery(source, message);
+        if (deliveries.putIfAbsent(delivery.deliveryId, delivery) != null) throw Protocol.bad();
+        if (deliveries.size() > 16) { delivery.finish(NotifierResult.failed("EXTERNAL_RATE_LIMITED")); return; }
+        long delay = Math.max(0, delivery.deadline - Instant.now().getEpochSecond());
+        ScheduledFuture<?> expiry = clock.schedule(() -> {
+            if (delivery.finished.compareAndSet(false, true)) deliveries.remove(delivery.deliveryId, delivery);
+        }, Math.min(delay, 300), TimeUnit.SECONDS);
+        Function<NotifierDelivery, ? extends CompletionStage<NotifierResult>> handler = notifiers.get(delivery.notifierId);
+        if (handler == null) { expiry.cancel(false); delivery.finish(NotifierResult.failed("EXTERNAL_SEND_FAILED")); return; }
+        try {
+            notifierHandlers.execute(() -> {
+                if (delivery.finished.get()) return;
+                try {
+                    CompletionStage<NotifierResult> result = Objects.requireNonNull(handler.apply(delivery));
+                    result.whenComplete((outcome, error) -> {
+                        expiry.cancel(false);
+                        delivery.finish(error == null && outcome != null ? outcome : NotifierResult.failed("EXTERNAL_SEND_FAILED"));
+                    });
+                } catch (Throwable error) { expiry.cancel(false); delivery.finish(NotifierResult.failed("EXTERNAL_SEND_FAILED")); }
+            });
+        } catch (RejectedExecutionException error) { expiry.cancel(false); delivery.finish(NotifierResult.failed("EXTERNAL_RATE_LIMITED")); }
+    }
+
     private static <T, U> CompletableFuture<U> map(CompletableFuture<T> source, Function<T, U> transform) {
         CompletableFuture<U> mapped = source.thenApply(transform);
         mapped.whenComplete((value, error) -> { if (mapped.isCancelled()) source.cancel(false); });
@@ -1047,7 +1335,7 @@ public final class CielClient implements AutoCloseable {
      * 幂等关闭客户端，停止重连和心跳，终止连接并释放身份目录锁。
      *
      * <p>未完成请求和等待以 {@code CLIENT_CLOSED} 异常完成；拒绝新的后台任务并尝试
-     * 中断本地命令处理线程。已经排队的回调可能继续执行，关闭也不保证撤销业务副作用。
+     * 中断本地命令和外部通知器处理线程。已经排队的回调可能继续执行，关闭也不保证撤销业务副作用。
      * 若设置了状态监听器，会在关闭调用线程同步通知 {@link State#CLOSED}。
      * 已关闭实例不能重新连接。
      */
@@ -1064,8 +1352,10 @@ public final class CielClient implements AutoCloseable {
             if (firstReady != null) firstReady.completeExceptionally(error);
             executions.values().forEach(execution -> execution.finished.set(true));
             executions.clear();
+            deliveries.values().forEach(delivery -> delivery.finished.set(true));
+            deliveries.clear();
             store.close();
-            clock.shutdownNow(); network.shutdownNow(); handlers.shutdownNow(); callbacks.shutdown();
+            clock.shutdownNow(); network.shutdownNow(); handlers.shutdownNow(); notifierHandlers.shutdownNow(); callbacks.shutdown();
             Consumer<State> listener = stateListener;
             if (listener != null) try { listener.accept(State.CLOSED); } catch (RuntimeException ignored) { }
         }

@@ -52,6 +52,16 @@ final class Protocol {
         return value;
     }
 
+    static String noControlText(String value, int limit, boolean nonblank) {
+        text(value, limit, nonblank);
+        for (int i = 0; i < value.length(); ) {
+            int cp = value.codePointAt(i);
+            if (Character.isISOControl(cp)) throw input("INVALID_TEXT");
+            i += Character.charCount(cp);
+        }
+        return value;
+    }
+
     static int bytes(String value) { return value.getBytes(StandardCharsets.UTF_8).length; }
     static String requestId() { return UUID.randomUUID().toString().replace("-", ""); }
 

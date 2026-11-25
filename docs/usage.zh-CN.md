@@ -15,7 +15,7 @@
 
 ## 安装
 
-依赖坐标：`top.spco.ciel:ciel-sdk-java:0.1.0`。
+依赖坐标：`top.spco.ciel:ciel-sdk-java:0.2.0`。
 
 本地使用时，将 SDK 安装到**本机 Maven 仓库**。项目也提供用于手动上传 Maven Central 的签名打包 workflow；生成上传包不会发布依赖，操作步骤见[发布到 Maven Central](#发布到-maven-central)。
 
@@ -36,7 +36,7 @@ repositories {
 }
 
 dependencies {
-    implementation("top.spco.ciel:ciel-sdk-java:0.1.0")
+    implementation("top.spco.ciel:ciel-sdk-java:0.2.0")
 }
 ```
 
@@ -51,7 +51,7 @@ Gradle 会自动解析 Gson 的传递依赖。JUnit 仅用于 SDK 自身测试�
 3. 将 SDK 源码和 workflow 推送到仓库默认分支。在 `build.gradle.kts` 中设置本次发布的版本号，然后选择 **Actions → Build Maven Central bundle → Run workflow**。
 4. 在该次运行的 **Artifacts** 中下载 `ciel-sdk-java-<版本>-central.zip`。上传 action 直接提供该 ZIP，不会再套一层 ZIP。在 Central Portal 点击 **Publish Component**，上传此文件，检查验证结果，通过后发布。
 
-ZIP 使用 Maven 仓库目录结构，例如 `top/spco/ciel/ciel-sdk-java/0.1.0/`，包含库、sources、Javadoc、POM、Gradle 模块元数据、PGP `.asc` 签名和校验文件。Gradle 生成并检查必需文件，workflow 还会检查 ZIP 完整性。详见 [Central 上传要求](https://central.sonatype.org/publish/publish-portal-upload/)。
+ZIP 使用 Maven 仓库目录结构，例如 `top/spco/ciel/ciel-sdk-java/0.2.0/`，包含库、sources、Javadoc、POM、Gradle 模块元数据、PGP `.asc` 签名和校验文件。Gradle 生成并检查必需文件，workflow 还会检查 ZIP 完整性。详见 [Central 上传要求](https://central.sonatype.org/publish/publish-portal-upload/)。
 
 同一任务也可通过 `./gradlew centralBundle` 执行，Windows 使用 `.\gradlew.bat centralBundle`，前提是进程环境提供 `SIGNING_KEY`，以及需要时的 `SIGNING_PASSWORD`。输出为 `build/central-bundle/ciel-sdk-java-<版本>-central.zip`。打包任务缺少签名凭据时会失败，普通构建和 `publishToMavenLocal` 不需要这些凭据。签名必须对应 ZIP 内的原始文件，签名完成后不要重建文件再上传。
 
@@ -137,7 +137,26 @@ var latest = client.getNotification(result.get("id").getAsString()).get();
 client.unregisterNotification("backup.done").get();
 ```
 
-收件人和渠道由 Ciel 用户偏好决定。返回值保留 `recipient_count`、各渠道状态（`PENDING`、`SENDING`、`DELIVERED`、`SKIPPED`、`FAILED`）和原因码。邮件被 SMTP 接受不等于用户已读。没有通知完成推送；超时恢复使用原请求 ID、相同类型、标题和正文，或查询已知通知 ID。
+收件人和渠道由 Ciel 用户偏好决定。返回值保留 `recipient_count`、各渠道状态（`PENDING`、`SENDING`、`DELIVERED`、`SKIPPED`、`FAILED`）和原因码。邮件或外部通知器接受投递不等于用户已读。没有通知完成推送；超时恢复使用原请求 ID、相同类型、标题和正文，或查询已知通知 ID。
+
+## 外部通知器
+
+外部通知器提供方可在单个实例上注册最多 32 个外部渠道（`inbox` 与 `email` 为保留 ID）。应先通过 `onNotifier` 安装本地处理函数，再连接并调用 `registerNotifier`：
+
+```java
+try (CielClient provider = new CielClient(directory)) {
+    provider.onNotifier("qq-bot", delivery -> {
+        // 将 delivery.title() 与 delivery.body() 发送到 delivery.target()。
+        return java.util.concurrent.CompletableFuture.completedFuture(
+                CielClient.NotifierResult.delivered());
+    });
+    provider.connect().get();
+    provider.registerNotifier("qq-bot", "QQ", "QQ 机器人通知渠道", "QQ 号").get();
+    new java.util.concurrent.CountDownLatch(1).await();
+}
+```
+
+新注册的外部通知器默认停用（`enabled = false`），需由管理员显式启用后才会派发真实用户通知；重复注册仅更新名称、描述和目标标签，不会重置启停状态，也不会清除用户已保存的目标地址或渠道偏好。使用 `unregisterNotifier` 注销服务端渠道（成功时同步移除本地处理函数），或使用 `removeNotifierHandler` 仅移除本地处理函数。投递失败时返回 `NotifierResult.failed()` 或带受控错误码的 `NotifierResult.failed(errorCode)`（`EXTERNAL_SEND_FAILED`、`EXTERNAL_TIMEOUT`、`EXTERNAL_RATE_LIMITED`、`EXTERNAL_TARGET_INVALID`、`EXTERNAL_AUTH_FAILED`、`EXTERNAL_REJECTED`）。投递结果严格绑定原连接，绝不跨重连提交或重放；`NotifierDelivery.toString()` 隐藏目标地址、标题和正文。
 
 ## 错误、并发与关闭
 
@@ -155,6 +174,7 @@ client.unregisterNotification("backup.done").get();
 | 发送队列／在途请求 | 各 64 |
 | 回调线程／队列 | 2 个线程／64 个排队任务 |
 | 命令线程／并发执行 | 4 个线程／最多 16 个执行 |
+| 外部通知器线程／并发投递 | 4 个线程／最多 16 个投递 |
 
 超出容量返回明确错误；回调队列溢出时停止连接，避免默默丢弃推送。回调可能并发，不承诺完成顺序。用户回调应尽快返回；SDK 心跳独立运行。
 
@@ -195,6 +215,7 @@ SDK 不设置 JVM 全局参数。
 ```powershell
 .\gradlew.bat runExample --args='enroll C:\grants\worker.json C:\private-worker'
 .\gradlew.bat runExample --args='serve C:\private-worker'
+.\gradlew.bat runExample --args='notifier C:\private-worker qq-bot'
 # 先注册另一个调用实例，并由管理员授予 demo.echo 调用权限。
 .\gradlew.bat runExample --args='call C:\private-caller <target-instance-id> demo.echo null'
 ```

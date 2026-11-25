@@ -15,7 +15,7 @@ The only external runtime dependency is **Gson 2.14.0**. HTTP, WebSocket, TLS, a
 
 ## Installation
 
-Coordinates: `top.spco.ciel:ciel-sdk-java:0.1.0`.
+Coordinates: `top.spco.ciel:ciel-sdk-java:0.2.0`.
 
 For local use, install the SDK into **your local Maven repository**. The project also provides a signed bundle workflow for manual Maven Central upload; producing a bundle does not publish the artifact. See [Publishing to Maven Central](#publishing-to-maven-central).
 
@@ -36,7 +36,7 @@ repositories {
 }
 
 dependencies {
-    implementation("top.spco.ciel:ciel-sdk-java:0.1.0")
+    implementation("top.spco.ciel:ciel-sdk-java:0.2.0")
 }
 ```
 
@@ -51,7 +51,7 @@ Gradle resolves Gson transitively. JUnit is used only for the SDK's tests; appli
 3. Push the SDK source and workflow to the repository's default branch. Set the intended release version in `build.gradle.kts`, then select **Actions → Build Maven Central bundle → Run workflow**.
 4. Download `ciel-sdk-java-<version>-central.zip` from the run's **Artifacts** section. The upload action delivers the ZIP directly, without an additional outer ZIP. On Central Portal, choose **Publish Component**, upload this file, inspect validation results, and publish the validated deployment.
 
-The ZIP follows Maven repository layout, for example `top/spco/ciel/ciel-sdk-java/0.1.0/`. It contains the library, sources, Javadoc, POM, Gradle module metadata, PGP `.asc` signatures, and checksums. Gradle creates and checks the required files; the workflow also checks ZIP integrity. See the [Central upload requirements](https://central.sonatype.org/publish/publish-portal-upload/).
+The ZIP follows Maven repository layout, for example `top/spco/ciel/ciel-sdk-java/0.2.0/`. It contains the library, sources, Javadoc, POM, Gradle module metadata, PGP `.asc` signatures, and checksums. Gradle creates and checks the required files; the workflow also checks ZIP integrity. See the [Central upload requirements](https://central.sonatype.org/publish/publish-portal-upload/).
 
 The same task is available as `./gradlew centralBundle` (Windows: `.\gradlew.bat centralBundle`) when `SIGNING_KEY` and, if needed, `SIGNING_PASSWORD` are provided in the process environment. It generates `build/central-bundle/ciel-sdk-java-<version>-central.zip`. Missing signing credentials fail the bundle task; ordinary builds and `publishToMavenLocal` work without them. Never sign one set of files and upload rebuilt files: the signatures must match the exact bytes in the ZIP.
 
@@ -137,7 +137,26 @@ var latest = client.getNotification(result.get("id").getAsString()).get();
 client.unregisterNotification("backup.done").get();
 ```
 
-Recipients and channels come from Ciel user preferences. Responses preserve `recipient_count`, per-channel statuses (`PENDING`, `SENDING`, `DELIVERED`, `SKIPPED`, `FAILED`), and reason codes. SMTP acceptance does not mean the user has read the email. There is no notification completion push. Recover after a timeout with the original request ID and identical type, title, and body, or query a known notification ID.
+Recipients and channels come from Ciel user preferences. Responses preserve `recipient_count`, per-channel statuses (`PENDING`, `SENDING`, `DELIVERED`, `SKIPPED`, `FAILED`), and reason codes. SMTP or external notifier acceptance does not mean the user has read the notification. There is no notification completion push. Recover after a timeout with the original request ID and identical type, title, and body, or query a known notification ID.
+
+## External notifiers
+
+An external notifier provider can register up to 32 channels per instance (`inbox` and `email` are reserved). Install each local handler with `onNotifier` before connecting and calling `registerNotifier`:
+
+```java
+try (CielClient provider = new CielClient(directory)) {
+    provider.onNotifier("qq-bot", delivery -> {
+        // Send delivery.title() and delivery.body() to delivery.target().
+        return java.util.concurrent.CompletableFuture.completedFuture(
+                CielClient.NotifierResult.delivered());
+    });
+    provider.connect().get();
+    provider.registerNotifier("qq-bot", "QQ", "QQ bot notifier", "QQ Number").get();
+    new java.util.concurrent.CountDownLatch(1).await();
+}
+```
+
+Newly registered external notifiers start disabled (`enabled = false`) until an administrator enables them; re-registering updates `name`, `description`, and `targetLabel` without resetting enablement or user targets/preferences. Use `unregisterNotifier` to remove a channel (and its local handler on success), or `removeNotifierHandler` to remove only the local handler. On failure, return `NotifierResult.failed()` or `NotifierResult.failed(errorCode)` with a controlled code (`EXTERNAL_SEND_FAILED`, `EXTERNAL_TIMEOUT`, `EXTERNAL_RATE_LIMITED`, `EXTERNAL_TARGET_INVALID`, `EXTERNAL_AUTH_FAILED`, `EXTERNAL_REJECTED`). Delivery results are bound to the original connection and are never sent across reconnections or replayed. `NotifierDelivery.toString()` redacts `target`, `title`, and `body`.
 
 ## Errors, concurrency, and shutdown
 
@@ -155,6 +174,7 @@ Default capacity limits:
 | Send queue / outstanding requests | 64 each |
 | Callback workers / queue | 2 workers / 64 queued tasks |
 | Command workers / concurrent executions | 4 workers / up to 16 executions |
+| Notifier workers / concurrent deliveries | 4 workers / up to 16 deliveries |
 
 Capacity exhaustion produces explicit errors. Callback queue overflow stops the connection instead of silently dropping pushes. Callbacks may run concurrently and have no guaranteed completion order. Keep callbacks short; heartbeat runs independently.
 
@@ -195,6 +215,7 @@ The SDK does not set global JVM options.
 ```powershell
 .\gradlew.bat runExample --args='enroll C:\grants\worker.json C:\private-worker'
 .\gradlew.bat runExample --args='serve C:\private-worker'
+.\gradlew.bat runExample --args='notifier C:\private-worker qq-bot'
 # Enroll a separate caller and grant it permission to invoke demo.echo first.
 .\gradlew.bat runExample --args='call C:\private-caller <target-instance-id> demo.echo null'
 ```

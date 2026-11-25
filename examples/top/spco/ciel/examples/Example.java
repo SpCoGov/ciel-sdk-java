@@ -13,6 +13,8 @@ public final class Example {
             System.out.println(CielClient.enroll(Path.of(args[1]), Path.of(args[2])).get());
         } else if (args.length == 2 && args[0].equals("serve")) {
             serve(Path.of(args[1]));
+        } else if (args.length == 3 && args[0].equals("notifier")) {
+            notifier(Path.of(args[1]), args[2]);
         } else if (args.length == 5 && args[0].equals("call")) {
             try (CielClient client = CielClient.connect(Path.of(args[1])).get()) {
                 String requestId = CielClient.newRequestId();
@@ -23,7 +25,25 @@ public final class Example {
                 System.out.println(result + ", output=" + result.output());
             }
         } else {
-            throw new IllegalArgumentException("enroll <grant.json> <private-dir> | serve <private-dir> | call <private-dir> <target-instance-id> <command-id> <JSON>");
+            throw new IllegalArgumentException("enroll <grant.json> <private-dir> | serve <private-dir> | notifier <private-dir> <notifier-id> | call <private-dir> <target-instance-id> <command-id> <JSON>");
+        }
+    }
+
+    private static void notifier(Path directory, String notifierId) throws Exception {
+        try (CielClient client = new CielClient(directory)) {
+            client.onState(state -> System.out.println("State: " + state))
+                    .onError(error -> System.err.println(error.code()))
+                    .onNotifier(notifierId, delivery -> {
+                        System.out.println("Deliver: " + delivery);
+                        return CompletableFuture.completedFuture(CielClient.NotifierResult.delivered());
+                    });
+            Runtime.getRuntime().addShutdownHook(new Thread(client::close));
+            client.connect().get();
+            client.registerNotifier(notifierId, "Example Notifier", "Java SDK external notifier example", "Target ID").get();
+            System.out.println("Instance: " + client.identity().instanceId() + ", notifier: " + notifierId);
+            while (client.state() != CielClient.State.CLOSED && client.state() != CielClient.State.FAILED) {
+                Thread.sleep(5000);
+            }
         }
     }
 

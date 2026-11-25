@@ -11,7 +11,9 @@ import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
@@ -46,11 +48,20 @@ class ServiceIntegrationTest {
             BlockingQueue<CielClient.CommandCall> completions = new LinkedBlockingQueue<>();
             CompletableFuture<CielClient.CommandResult> delayedResult = new CompletableFuture<>();
             CountDownLatch delayedStarted = new CountDownLatch(1);
+            CompletableFuture<CielClient.NotifierResult> delayedDeliveryResult = new CompletableFuture<>();
+            CountDownLatch delayedDeliveryStarted = new CountDownLatch(1);
+            BlockingQueue<CielClient.NotifierDelivery> receivedDeliveries = new LinkedBlockingQueue<>();
+            AtomicReference<Function<CielClient.NotifierDelivery, CompletionStage<CielClient.NotifierResult>>> notifierBehavior =
+                    new AtomicReference<>(delivery -> CompletableFuture.completedFuture(CielClient.NotifierResult.delivered()));
             try (CielClient worker = new CielClient(workerHome); CielClient caller = new CielClient(callerHome)) {
                 worker.onCommand("demo.echo", execution -> {
                     executions.incrementAndGet();
                     return CompletableFuture.completedFuture(new CielClient.CommandResult(true, execution.input()));
-                }).onCommand("demo.delayed", execution -> { delayedStarted.countDown(); return delayedResult; });
+                }).onCommand("demo.delayed", execution -> { delayedStarted.countDown(); return delayedResult; })
+                        .onNotifier("qq-bot", delivery -> {
+                            receivedDeliveries.add(delivery);
+                            return notifierBehavior.get().apply(delivery);
+                        });
                 caller.onEvent("demo.changed", events::add).onCommandCompleted(completions::add).onState(states::add);
                 worker.connect().get(20, TimeUnit.SECONDS);
                 caller.connect().get(20, TimeUnit.SECONDS);
@@ -111,6 +122,60 @@ class ServiceIntegrationTest {
                 assertEquals(notificationId, Protocol.string(worker.getNotification(notificationId).get(5, TimeUnit.SECONDS), "id"));
                 assertEquals("REQUEST_ID_CONFLICT", failure(worker.sendNotification("backup.done", "changed", "已保存", notificationRequest)).code());
 
+                // External notifier registration, conflict, admin test, delivery, controlled failure, and no-replay.
+                assertEquals("NOTIFIER_HANDLER_REQUIRED", assertThrows(CielException.class,
+                        () -> worker.registerNotifier("missing.chan", "Missing", "")).code());
+                worker.onNotifier("email", d -> CompletableFuture.completedFuture(CielClient.NotifierResult.delivered()));
+                assertEquals("RESERVED_NOTIFIER", failure(worker.registerNotifier("email", "Email", "")).code());
+                worker.removeNotifierHandler("email");
+                worker.registerNotifier("qq-bot", "QQ", "QQ bot notifier", "QQ 号").get(5, TimeUnit.SECONDS);
+                caller.onNotifier("qq-bot", d -> CompletableFuture.completedFuture(CielClient.NotifierResult.delivered()));
+                assertEquals("NOTIFIER_CONFLICT", failure(caller.registerNotifier("qq-bot", "QQ Conflict", "")).code());
+                caller.removeNotifierHandler("qq-bot");
+
+                JsonObject testResponse = server.api("POST", "/api/notifiers/qq-bot/test", "{\"target\":\"10001\"}");
+                assertTrue(testResponse.get("ok").getAsBoolean());
+                CielClient.NotifierDelivery testDelivery = receivedDeliveries.poll(5, TimeUnit.SECONDS);
+                assertNotNull(testDelivery);
+                assertTrue(testDelivery.deliveryId().startsWith("test-"));
+                assertEquals("qq-bot", testDelivery.notifierId());
+                assertEquals("ciel:test", testDelivery.serviceId());
+                assertEquals("10001", testDelivery.target());
+                assertFalse(testDelivery.toString().contains("10001"));
+                assertFalse(testDelivery.toString().contains(testDelivery.body()));
+
+                server.api("PUT", "/api/notifiers/qq-bot", "{\"enabled\":true}");
+                server.api("PUT", "/api/notification-settings/notifiers/qq-bot", "{\"target\":\"10002\"}");
+                server.api("PUT", "/api/notification-services/" + workerIdentity.instanceId() + "/preferences",
+                        "{\"enabled\":true,\"default_channels\":[\"inbox\",\"qq-bot\"]}");
+
+                JsonObject extOk = worker.sendNotification("backup.done", "外部成功", "已推送", CielClient.newRequestId()).get(5, TimeUnit.SECONDS);
+                String extOkId = Protocol.string(extOk, "id");
+                CielClient.NotifierDelivery delivered = receivedDeliveries.poll(5, TimeUnit.SECONDS);
+                assertNotNull(delivered);
+                assertEquals("10002", delivered.target());
+                assertEquals("java.worker", delivered.serviceId());
+                eventually(() -> {
+                    try {
+                        return hasDeliveryStatus(worker.getNotification(extOkId).get(5, TimeUnit.SECONDS), "qq-bot", "DELIVERED", null);
+                    } catch (Exception error) { throw new RuntimeException(error); }
+                }, 5);
+
+                notifierBehavior.set(d -> CompletableFuture.completedFuture(CielClient.NotifierResult.failed("EXTERNAL_TIMEOUT")));
+                JsonObject extFail = worker.sendNotification("backup.done", "外部失败", "超时测试", CielClient.newRequestId()).get(5, TimeUnit.SECONDS);
+                String extFailId = Protocol.string(extFail, "id");
+                assertNotNull(receivedDeliveries.poll(5, TimeUnit.SECONDS));
+                eventually(() -> {
+                    try {
+                        return hasDeliveryStatus(worker.getNotification(extFailId).get(5, TimeUnit.SECONDS), "qq-bot", "FAILED", "EXTERNAL_TIMEOUT");
+                    } catch (Exception error) { throw new RuntimeException(error); }
+                }, 5);
+
+                notifierBehavior.set(d -> { delayedDeliveryStarted.countDown(); return delayedDeliveryResult; });
+                JsonObject extLost = worker.sendNotification("backup.done", "重启不重放", "断线测试", CielClient.newRequestId()).get(5, TimeUnit.SECONDS);
+                String extLostId = Protocol.string(extLost, "id");
+                assertTrue(delayedDeliveryStarted.await(5, TimeUnit.SECONDS));
+
                 String delayedRequest = CielClient.newRequestId();
                 CielClient.CommandCall delayed = caller.invokeCommand(workerIdentity.instanceId(), "demo.delayed", null, 120, delayedRequest).get(5, TimeUnit.SECONDS);
                 assertTrue(delayedStarted.await(5, TimeUnit.SECONDS));
@@ -128,6 +193,8 @@ class ServiceIntegrationTest {
                 assertEquals("UNKNOWN", caller.getCommand(delayed.id()).get(5, TimeUnit.SECONDS).status());
                 delayedResult.complete(new CielClient.CommandResult(true, new JsonPrimitive("too late")));
                 assertEquals("UNKNOWN", caller.getCommand(delayed.id()).get(5, TimeUnit.SECONDS).status());
+                delayedDeliveryResult.complete(CielClient.NotifierResult.delivered());
+                assertTrue(hasDeliveryStatus(worker.getNotification(extLostId).get(5, TimeUnit.SECONDS), "qq-bot", "FAILED", null));
                 assertEquals(delayed.id(), caller.invokeCommand(workerIdentity.instanceId(), "demo.delayed", null, 120, delayedRequest).get(5, TimeUnit.SECONDS).id());
                 worker.publishEvent("demo.changed", payload, CielClient.newRequestId()).get(5, TimeUnit.SECONDS);
                 assertNotNull(events.poll(5, TimeUnit.SECONDS)); // Relationship survived reconnect without replay.
@@ -154,6 +221,8 @@ class ServiceIntegrationTest {
                 worker.unregisterCommand("demo.echo").get(5, TimeUnit.SECONDS);
                 worker.unregisterCommand("demo.delayed").get(5, TimeUnit.SECONDS);
                 worker.unregisterNotification("backup.done").get(5, TimeUnit.SECONDS);
+                worker.unregisterNotifier("qq-bot").get(5, TimeUnit.SECONDS);
+                worker.unregisterNotifier("qq-bot").get(5, TimeUnit.SECONDS);
                 worker.close();
                 assertEquals("NOT_READY", failure(worker.publishEvent("demo.changed", null, CielClient.newRequestId())).code());
             }
@@ -202,6 +271,17 @@ class ServiceIntegrationTest {
                 assertEquals(CielClient.State.FAILED, invalid.state());
             }
         }
+    }
+
+    static boolean hasDeliveryStatus(JsonObject notification, String notifierId, String status, String errorCode) {
+        for (JsonElement item : notification.getAsJsonArray("deliveries")) {
+            JsonObject delivery = item.getAsJsonObject();
+            if (!notifierId.equals(Protocol.string(delivery, "notifier_id"))) continue;
+            if (!status.equals(Protocol.string(delivery, "status"))) continue;
+            if (errorCode == null) return true;
+            if (!delivery.get("error_code").isJsonNull() && errorCode.equals(Protocol.string(delivery, "error_code"))) return true;
+        }
+        return false;
     }
 
     static CielException failure(CompletableFuture<?> future) throws Exception {
