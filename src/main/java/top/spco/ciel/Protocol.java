@@ -92,11 +92,15 @@ final class Protocol {
     }
 
     static JsonElement parse(String text) {
-        if (bytes(text) > 32768) throw bad();
+        return parse(text, 32768);
+    }
+
+    static JsonElement parse(String text, int limit) {
+        if (bytes(text) > limit) throw bad();
         try (JsonReader reader = new JsonReader(new StringReader(text))) {
             reader.setStrictness(Strictness.STRICT);
             reader.setNestingLimit(64);
-            JsonElement value = read(reader);
+            JsonElement value = read(reader, limit);
             if (reader.peek() != JsonToken.END_DOCUMENT) throw bad();
             return value;
         } catch (IOException | IllegalStateException | NumberFormatException | CielException error) {
@@ -104,15 +108,15 @@ final class Protocol {
         }
     }
 
-    private static JsonElement read(JsonReader reader) throws IOException {
+    private static JsonElement read(JsonReader reader, int limit) throws IOException {
         return switch (reader.peek()) {
             case BEGIN_OBJECT -> {
                 JsonObject value = new JsonObject();
                 reader.beginObject();
                 while (reader.hasNext()) {
-                    String name = text(reader.nextName(), 32768, false);
+                    String name = text(reader.nextName(), limit, false);
                     if (value.has(name)) throw bad();
-                    value.add(name, read(reader));
+                    value.add(name, read(reader, limit));
                 }
                 reader.endObject();
                 yield value;
@@ -120,11 +124,11 @@ final class Protocol {
             case BEGIN_ARRAY -> {
                 JsonArray value = new JsonArray();
                 reader.beginArray();
-                while (reader.hasNext()) value.add(read(reader));
+                while (reader.hasNext()) value.add(read(reader, limit));
                 reader.endArray();
                 yield value;
             }
-            case STRING -> new JsonPrimitive(text(reader.nextString(), 32768, false));
+            case STRING -> new JsonPrimitive(text(reader.nextString(), limit, false));
             case NUMBER -> JsonParser.parseString(reader.nextString());
             case BOOLEAN -> new JsonPrimitive(reader.nextBoolean());
             case NULL -> { reader.nextNull(); yield JsonNull.INSTANCE; }

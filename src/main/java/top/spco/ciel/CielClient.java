@@ -1,6 +1,9 @@
 package top.spco.ciel;
 
 import com.google.gson.*;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.time.*;
 import java.util.*;
@@ -11,7 +14,9 @@ import java.util.function.*;
 /**
  * 通过固定 SPKI Pin 的 TLS 1.3 WebSocket 接入 Ciel v1 的线程安全客户端。
  *
- * <p>先使用 {@link #enroll(Path, Path)} 注册身份，再创建客户端、安装监听器、命令处理函数
+ * <p>托管服务可通过 {@link #connectManaged()} 使用 Ciel 预置的身份。若提供命令或外部通知器，
+ * 可通过 {@link #managedIdentityDir()} 构造客户端，以便在连接前安装处理函数。
+ * 外部服务先使用 {@link #enroll(Path, Path)} 注册身份，再创建客户端、安装监听器、命令处理函数
  * 与外部通知器处理函数，最后调用 {@link #connect()}。业务请求仅在 {@link State#READY} 时发送；
  * 客户端负责应用心跳和临时故障重连，但不会自动重放业务请求。实例使用完毕后必须调用 {@link #close()}
  * 释放身份锁。
@@ -560,10 +565,91 @@ public final class CielClient implements AutoCloseable {
      * @throws CielException 身份加载或锁定失败时同步抛出
      */
     public static CompletableFuture<CielClient> connect(Path directory) {
-        CielClient client = new CielClient(directory);
+        return connect(directory, Options.defaults());
+    }
+
+    /**
+     * 使用指定的超时及重连配置连接已有的服务身份。
+     *
+     * @param directory 含 {@code identity.json} 的私有目录
+     * @param options 超时和重连配置
+     * @return 首次进入 {@link State#READY} 后完成的客户端 Future，成功后由调用方关闭
+     * @throws NullPointerException 目录或配置为空时
+     * @throws CielException 身份加载或锁定失败时同步抛出
+     */
+    public static CompletableFuture<CielClient> connect(Path directory, Options options) {
+        CielClient client = new CielClient(directory, options);
         CompletableFuture<CielClient> ready = client.connect();
         ready.whenComplete((value, error) -> { if (error != null) client.close(); });
         return ready;
+    }
+
+    /**
+     * 使用默认配置连接 Ciel 为当前托管进程预置的服务身份。
+     *
+     * @return 使用 {@code CIEL_IDENTITY_DIR} 鉴权并首次进入 READY 后完成的客户端 Future
+     * @throws CielException 缺少或空的身份目录环境变量时同步抛出 {@code MANAGED_IDENTITY_DIR_MISSING}，身份加载或锁定失败时同步抛出存储错误
+     * @see #connectManaged(Options)
+     */
+    public static CompletableFuture<CielClient> connectManaged() {
+        return connectManaged(Options.defaults());
+    }
+
+    /**
+     * 从 {@code CIEL_IDENTITY_DIR} 加载托管身份，按指定配置建立固定 Pin 的 WSS 连接。
+     *
+     * @param options 超时和重连配置
+     * @return 首次进入 {@link State#READY} 后完成的客户端 Future，成功后由调用方关闭
+     * @throws NullPointerException 配置为空时
+     * @throws CielException 身份目录变量缺失或为空时同步抛出 {@code MANAGED_IDENTITY_DIR_MISSING}，身份无效或被占用时同步抛出存储错误
+     */
+    public static CompletableFuture<CielClient> connectManaged(Options options) {
+        return connect(managedIdentityDir(), options);
+    }
+
+    /**
+     * 读取托管服务的身份目录。将此路径传给 {@link #CielClient(Path)}，即可在调用
+     * {@link #connect()} 前通过 {@link #onCommand(String, Function)} 或
+     * {@link #onNotifier(String, Function)} 安装本地处理函数。
+     *
+     * @return 环境变量 {@code CIEL_IDENTITY_DIR} 指定的路径
+     * @throws CielException 环境变量缺失或为空时抛出 {@code MANAGED_IDENTITY_DIR_MISSING}，
+     *         路径格式无效时抛出 {@code INVALID_IDENTITY_DIRECTORY}
+     */
+    public static Path managedIdentityDir() {
+        return managedPath("CIEL_IDENTITY_DIR", "MANAGED_IDENTITY_DIR_MISSING", "INVALID_IDENTITY_DIRECTORY");
+    }
+
+    /**
+     * 读取 {@code CIEL_CONFIG_PATH} 指向的托管配置文件，按 UTF-8 解析最多 65536 字节。
+     *
+     * @return 独立的 JSON 对象副本，包含已保存的密钥字段
+     * @throws CielException 没有配置路径时抛出 {@code MANAGED_CONFIG_PATH_MISSING}，文件不是普通文件、含符号链接、超限或 JSON 无效时抛出 {@code INVALID_CONFIG_FILE}
+     */
+    public static JsonObject loadManagedConfig() {
+        Path path = managedPath("CIEL_CONFIG_PATH", "MANAGED_CONFIG_PATH_MISSING", "INVALID_CONFIG_FILE");
+        return IdentityStore.read(path, 65536, "INVALID_CONFIG_FILE").deepCopy();
+    }
+
+    /**
+     * 读取 {@code CIEL_WORK_DIR} 指定的托管实例持久化工作目录。
+     *
+     * @return 已规范化的绝对目录路径
+     * @throws CielException 没有工作目录变量时抛出 {@code MANAGED_WORK_DIR_MISSING}，路径无效或不是现有的普通目录时抛出 {@code INVALID_WORK_DIR}
+     */
+    public static Path managedWorkDir() {
+        Path directory = managedPath("CIEL_WORK_DIR", "MANAGED_WORK_DIR_MISSING", "INVALID_WORK_DIR")
+                .toAbsolutePath().normalize();
+        if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS))
+            throw new CielException(CielException.Kind.STORAGE, "INVALID_WORK_DIR");
+        return directory;
+    }
+
+    private static Path managedPath(String variable, String missing, String invalid) {
+        String value = System.getenv(variable);
+        if (value == null || value.isEmpty()) throw new CielException(CielException.Kind.STORAGE, missing);
+        try { return Path.of(value); }
+        catch (InvalidPathException error) { throw new CielException(CielException.Kind.STORAGE, invalid); }
     }
 
     /**

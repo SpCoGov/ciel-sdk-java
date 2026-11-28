@@ -9,7 +9,7 @@
 | 运行 SDK | Java 17 或更高版本 |
 | 构建 SDK | JDK 25，使用仓库自带的 Gradle Wrapper |
 | 运行两套测试 | JDK 17 和 JDK 25 |
-| 连接 Ciel | 已运行的 Ciel 服务端，以及管理员创建的注册授权 |
+| 连接 Ciel | 已运行的 Ciel 服务端，以及托管身份或外部服务的注册授权 |
 
 运行时唯一的外部依赖是 **Gson 2.14.0**。HTTP、WebSocket、TLS、异步任务、文件锁及日志均使用 JDK 标准库。日志接口为 `System.Logger`，日志后端由宿主应用选择。
 
@@ -58,6 +58,29 @@ ZIP 使用 Maven 仓库目录结构，例如 `top/spco/ciel/ciel-sdk-java/0.2.0/
 发布 workflow 会在两套 Java 环境运行单元和 TLS 测试。真实服务集成测试需要 `cielServerBinary`，在此 workflow 中会跳过。版本发布到 Central 后，后续发布需使用新的版本号。
 
 ## 首次注册与连接
+
+### 托管服务
+
+将可执行 JAR 放入 ZIP，并在根目录的 `ciel-service.json` 中声明 `jvm` 运行时和 JAR 路径。将 SDK 和 Gson 一起打进可执行 JAR，或按 JAR 清单的 `Class-Path` 相对路径放入 ZIP 中。管理员上传、配置并启动服务后，Ciel 会在拉起 Java 前预置身份并写入配置。
+
+```java
+JsonObject config = CielClient.loadManagedConfig();
+Path work = CielClient.managedWorkDir();
+try (CielClient client = new CielClient(CielClient.managedIdentityDir())) {
+    client.onCommand("demo.echo", Worker::echo);
+    client.onNotifier("qq-bot", Worker::deliver);
+    client.connect().get();
+    client.registerCommand("demo.echo", "返回输入的 JSON").get();
+    client.registerNotifier("qq-bot", "QQ", "QQ 机器人通知器", "QQ 号码").get();
+    runWorker(client, config, work); // 运行服务自己的业务循环。
+}
+```
+
+Ciel 会保留已注册的命令和外部通知器。每次启动时都应在调用 `connect()` 前安装本地处理函数（示例中的 `Worker::echo` 和 `Worker::deliver`），以便进入 READY 后立即处理请求。无需安装这些处理函数的服务可通过 `CielClient.connectManaged().get()` 或 `connectManaged(options)` 使用 `CIEL_IDENTITY_DIR` 直接连接。
+
+`loadManagedConfig()` 从 `CIEL_CONFIG_PATH` 读取最多 65536 个 UTF-8 字节，每次返回独立的 Gson `JsonObject`，其中可能包含已保存的密钥。`managedWorkDir()` 返回 `CIEL_WORK_DIR` 指定的目录，可存放升级程序包后仍需保留的数据。
+
+### 外部服务
 
 管理员在 Ciel 中创建注册授权，将 JSON 保存为 `grant.json`。授权包含服务器 WSS 地址、SPKI Pin、服务 ID 和一次性令牌。为该实例选择一个私有身份目录，授权和身份文件均不应提交到版本控制。
 

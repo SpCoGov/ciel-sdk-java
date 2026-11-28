@@ -56,20 +56,24 @@ final class IdentityStore implements AutoCloseable {
     }
 
     static JsonObject read(Path path) {
+        return read(path, 16384, "INVALID_IDENTITY_FILE");
+    }
+
+    static JsonObject read(Path path, int limit, String invalid) {
         try {
-            if (Files.isSymbolicLink(path)) throw new IOException("SYMLINK_IDENTITY_REJECTED");
+            if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) throw new IOException();
             // The channel bound also protects against a file growing after a size check.
             try (FileChannel file = FileChannel.open(path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) {
-                if (file.size() > 16384) throw new IOException("IDENTITY_FILE_TOO_LARGE");
-                ByteBuffer buffer = ByteBuffer.allocate(16385);
+                if (file.size() > limit) throw new IOException();
+                ByteBuffer buffer = ByteBuffer.allocate(limit + 1);
                 while (file.read(buffer) > 0 && buffer.hasRemaining()) { }
-                if (buffer.position() > 16384) throw new IOException("IDENTITY_FILE_TOO_LARGE");
+                if (buffer.position() > limit) throw new IOException();
                 buffer.flip();
                 String json = java.nio.charset.StandardCharsets.UTF_8.newDecoder().decode(buffer).toString();
-                return Protocol.object(Protocol.parse(json));
+                return Protocol.object(Protocol.parse(json, limit));
             }
         } catch (IOException | RuntimeException error) {
-            throw new CielException(CielException.Kind.STORAGE, "INVALID_IDENTITY_FILE");
+            throw new CielException(CielException.Kind.STORAGE, invalid);
         }
     }
 

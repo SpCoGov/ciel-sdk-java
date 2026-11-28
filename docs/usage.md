@@ -9,7 +9,7 @@
 | Run the SDK | Java 17 or later |
 | Build the SDK | JDK 25; use the included Gradle Wrapper |
 | Run both test suites | JDK 17 and JDK 25 |
-| Connect to Ciel | A running Ciel server and an administrator-issued enrollment grant |
+| Connect to Ciel | A running Ciel server and a managed identity or an enrollment grant for an external service |
 
 The only external runtime dependency is **Gson 2.14.0**. HTTP, WebSocket, TLS, asynchronous tasks, file locks, and logging use the JDK. The logging API is `System.Logger`; the host application chooses its logging backend.
 
@@ -58,6 +58,29 @@ The same task is available as `./gradlew centralBundle` (Windows: `.\gradlew.bat
 The release workflow runs unit and TLS tests on both Java versions. Real-server integration tests require `cielServerBinary` and are skipped in this workflow. After a version is published to Central, use a new version for later releases.
 
 ## Enrollment and connection
+
+### Managed services
+
+Package your executable JAR in a ZIP with a root `ciel-service.json` that declares the `jvm` runtime and JAR path. Bundle the SDK and Gson in the executable JAR or include them at the relative paths in its manifest's `Class-Path`. When an administrator uploads, configures, and starts the service, Ciel provisions its identity and writes the configuration before launching Java.
+
+```java
+JsonObject config = CielClient.loadManagedConfig();
+Path work = CielClient.managedWorkDir();
+try (CielClient client = new CielClient(CielClient.managedIdentityDir())) {
+    client.onCommand("demo.echo", Worker::echo);
+    client.onNotifier("qq-bot", Worker::deliver);
+    client.connect().get();
+    client.registerCommand("demo.echo", "Return input JSON").get();
+    client.registerNotifier("qq-bot", "QQ", "QQ bot notifier", "QQ Number").get();
+    runWorker(client, config, work); // Your service loop.
+}
+```
+
+Ciel retains command and notifier registrations across restarts. Install your local handlers (here, `Worker::echo` and `Worker::deliver`) before calling `connect()` on every launch so they can serve requests as soon as the client reaches READY. Services without these handlers can use `CielClient.connectManaged().get()` or `connectManaged(options)` to connect directly using `CIEL_IDENTITY_DIR`.
+
+`loadManagedConfig()` returns a fresh Gson `JsonObject` from `CIEL_CONFIG_PATH` (up to 65,536 UTF-8 bytes). Its values can include saved secrets. Store persistent service data under `managedWorkDir()`, which reads `CIEL_WORK_DIR` and survives package upgrades.
+
+### External services
 
 Create an enrollment grant in Ciel as an administrator and save the JSON as `grant.json`. It contains the server WSS address, SPKI pin, service ID, and a one-time token. Choose a private identity directory for this instance. Keep the grant and identity files out of version control.
 

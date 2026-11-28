@@ -3,6 +3,7 @@ package top.spco.ciel;
 import com.google.gson.*;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.TempDir;
+import java.io.*;
 import java.net.*;
 import java.net.http.*;
 import java.nio.file.*;
@@ -14,12 +15,79 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
+import java.util.jar.*;
+import java.util.zip.*;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /** Runs against a separate real Ciel process and private, disposable database. */
 class ServiceIntegrationTest {
     @TempDir Path directory;
+
+    @Test @Timeout(150) void uploadedJvmProviderReconnectsWithRegisteredHandlersAfterRestart() throws Exception {
+        String binary = System.getProperty("ciel.server.binary");
+        assumeTrue(binary != null, "Pass -PcielServerBinary to test a managed package");
+        Path archive = directory.resolve("service.zip");
+        Manifest manifest = new Manifest();
+        manifest.getMainAttributes().put(Attributes.Name.MANIFEST_VERSION, "1.0");
+        manifest.getMainAttributes().put(Attributes.Name.MAIN_CLASS, ManagedTest.Probe.class.getName());
+        manifest.getMainAttributes().put(Attributes.Name.CLASS_PATH, "classes/ gson.jar");
+        ByteArrayOutputStream jar = new ByteArrayOutputStream();
+        String probe = ManagedTest.Probe.class.getName().replace('.', '/') + ".class";
+        try (JarOutputStream out = new JarOutputStream(jar, manifest);
+             InputStream code = ManagedTest.Probe.class.getResourceAsStream("/" + probe)) {
+            out.putNextEntry(new JarEntry(probe));
+            Objects.requireNonNull(code).transferTo(out);
+        }
+        Path classes = Path.of(CielClient.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        Path gson = Path.of(JsonObject.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        try (ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(archive));
+             var entries = Files.walk(classes)) {
+            zip.putNextEntry(new ZipEntry("ciel-service.json"));
+            zip.write("""
+                    {"schema_version":1,"service_id":"java.managed","name":"Java worker","version":"1",
+                     "runtime":{"kind":"jvm","jar":"probe.jar","args":["service"]},
+                     "config_schema":[{"type":"string","key":"label","label":"Label","default":"ready"}]}
+                    """.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            zip.putNextEntry(new ZipEntry("probe.jar")); jar.writeTo(zip);
+            zip.putNextEntry(new ZipEntry("gson.jar")); Files.copy(gson, zip);
+            for (Path file : entries.filter(Files::isRegularFile).toList()) {
+                zip.putNextEntry(new ZipEntry("classes/" + classes.relativize(file).toString().replace(File.separatorChar, '/')));
+                Files.copy(file, zip);
+            }
+        }
+        try (Server server = new Server(Path.of(binary), directory)) {
+            HttpResponse<String> upload = server.http.send(HttpRequest.newBuilder(URI.create(server.origin + "/api/managed-services"))
+                    .header("Origin", server.origin).header("X-Ciel-Request", "1").header("Cookie", server.cookie)
+                    .header("Content-Type", "application/zip").POST(HttpRequest.BodyPublishers.ofFile(archive)).build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(201, upload.statusCode(), upload.body());
+            String id = Protocol.string(Protocol.object(Protocol.parse(upload.body())), "id");
+            String base = "/api/managed-services/" + id;
+            Path ready = server.data.resolve("managed").resolve(id).resolve("work/ready");
+            try {
+                for (String action : List.of("start", "restart")) {
+                    server.api("POST", base + "/" + action, null);
+                    try { eventually(() -> Files.exists(ready), 40); }
+                    catch (AssertionError failure) {
+                        JsonObject detail = server.api("GET", "/api/instances/" + id, null);
+                        throw new AssertionError("JVM worker did not become ready after " + action + ": "
+                                + detail.getAsJsonObject("managed_service").get("process") + " "
+                                + server.api("GET", base + "/logs", null).get("lines"), failure);
+                    }
+                    assertEquals(id + " ready", Files.readString(ready));
+                    Files.delete(ready);
+                    JsonObject detail = server.api("GET", "/api/instances/" + id, null);
+                    assertEquals("ONLINE", Protocol.string(detail, "presence"));
+                    assertEquals("RUNNING", Protocol.string(detail.getAsJsonObject("managed_service").getAsJsonObject("process"), "state"));
+                    assertEquals("demo.echo", Protocol.string(detail.getAsJsonArray("registered_commands").get(0).getAsJsonObject(), "id"));
+                    assertEquals("demo.notifier", Protocol.string(detail.getAsJsonArray("registered_notifiers").get(0).getAsJsonObject(), "id"));
+                }
+            } finally {
+                server.api("POST", base + "/stop", null);
+            }
+        }
+    }
 
     @Test @Timeout(180) void realPinnedWssEnrollmentEventsCommandsNotificationsHeartbeatAndRecovery() throws Exception {
         String binary = System.getProperty("ciel.server.binary");
@@ -329,8 +397,12 @@ class ServiceIntegrationTest {
             builder.environment().put("CIEL_WEB_DIR", web.toString());
             builder.environment().put("CIEL_LISTEN", "127.0.0.1:" + port);
             builder.environment().put("CIEL_ORIGIN", origin);
+            builder.environment().put("CIEL_JAVA_BIN", ProcessHandle.current().info().command().orElseThrow());
             process = builder.start();
-            eventually(() -> Files.exists(data.resolve("tls/server.crt")), 10);
+            eventually(() -> {
+                if (!process.isAlive()) throw new AssertionError("Isolated Ciel exited; inspect server.log");
+                return Files.exists(data.resolve("tls/server.crt"));
+            }, 45);
             X509Certificate certificate;
             try (var stream = Files.newInputStream(data.resolve("tls/server.crt"))) {
                 certificate = (X509Certificate) CertificateFactory.getInstance("X.509").generateCertificate(stream);
