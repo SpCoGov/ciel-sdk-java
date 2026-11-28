@@ -20,7 +20,7 @@
 
 ## 🛠️ Getting started
 
-Requires **Java 17+**. Build from source with **JDK 25** and the included Gradle Wrapper. The Maven coordinate is `top.spco.ciel:ciel-sdk-java:0.2.0`; the SDK has not yet been published to Maven Central.
+Requires **Java 17+**. Build from source with **JDK 25** and the included Gradle Wrapper. The Maven coordinate is `top.spco.ciel:ciel-sdk-java:0.3.0`; the SDK has not yet been published to Maven Central.
 
 Clone the repository and install it into your local Maven repository:
 
@@ -41,7 +41,7 @@ repositories {
 }
 
 dependencies {
-    implementation("top.spco.ciel:ciel-sdk-java:0.2.0")
+    implementation("top.spco.ciel:ciel-sdk-java:0.3.0")
 }
 ```
 

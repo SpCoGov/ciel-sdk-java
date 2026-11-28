@@ -20,7 +20,7 @@
 
 ## 🛠️ 快速开始
 
-运行需要 **Java 17+**，源码构建需要 **JDK 25** 和仓库自带的 Gradle Wrapper。依赖坐标为 `top.spco.ciel:ciel-sdk-java:0.2.0`，目前尚未发布到 Maven Central。
+运行需要 **Java 17+**，源码构建需要 **JDK 25** 和仓库自带的 Gradle Wrapper。依赖坐标为 `top.spco.ciel:ciel-sdk-java:0.3.0`，目前尚未发布到 Maven Central。
 
 克隆仓库，将 SDK 安装到本机 Maven 仓库：
 
@@ -41,7 +41,7 @@ repositories {
 }
 
 dependencies {
-    implementation("top.spco.ciel:ciel-sdk-java:0.2.0")
+    implementation("top.spco.ciel:ciel-sdk-java:0.3.0")
 }
 ```
 

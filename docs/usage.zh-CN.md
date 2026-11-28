@@ -15,7 +15,7 @@
 
 ## 安装
 
-依赖坐标：`top.spco.ciel:ciel-sdk-java:0.2.0`。
+依赖坐标：`top.spco.ciel:ciel-sdk-java:0.3.0`。
 
 本地使用时，将 SDK 安装到**本机 Maven 仓库**。项目也提供用于手动上传 Maven Central 的签名打包 workflow；生成上传包不会发布依赖，操作步骤见[发布到 Maven Central](#发布到-maven-central)。
 
@@ -36,7 +36,7 @@ repositories {
 }
 
 dependencies {
-    implementation("top.spco.ciel:ciel-sdk-java:0.2.0")
+    implementation("top.spco.ciel:ciel-sdk-java:0.3.0")
 }
 ```
 
@@ -51,7 +51,7 @@ Gradle 会自动解析 Gson 的传递依赖。JUnit 仅用于 SDK 自身测试�
 3. 将 SDK 源码和 workflow 推送到仓库默认分支。在 `build.gradle.kts` 中设置本次发布的版本号，然后选择 **Actions → Build Maven Central bundle → Run workflow**。
 4. 在该次运行的 **Artifacts** 中下载 `ciel-sdk-java-<版本>-central.zip`。上传 action 直接提供该 ZIP，不会再套一层 ZIP。在 Central Portal 点击 **Publish Component**，上传此文件，检查验证结果，通过后发布。
 
-ZIP 使用 Maven 仓库目录结构，例如 `top/spco/ciel/ciel-sdk-java/0.2.0/`，包含库、sources、Javadoc、POM、Gradle 模块元数据、PGP `.asc` 签名和校验文件。Gradle 生成并检查必需文件，workflow 还会检查 ZIP 完整性。详见 [Central 上传要求](https://central.sonatype.org/publish/publish-portal-upload/)。
+ZIP 使用 Maven 仓库目录结构，例如 `top/spco/ciel/ciel-sdk-java/0.3.0/`，包含库、sources、Javadoc、POM、Gradle 模块元数据、PGP `.asc` 签名和校验文件。Gradle 生成并检查必需文件，workflow 还会检查 ZIP 完整性。详见 [Central 上传要求](https://central.sonatype.org/publish/publish-portal-upload/)。
 
 同一任务也可通过 `./gradlew centralBundle` 执行，Windows 使用 `.\gradlew.bat centralBundle`，前提是进程环境提供 `SIGNING_KEY`，以及需要时的 `SIGNING_PASSWORD`。输出为 `build/central-bundle/ciel-sdk-java-<版本>-central.zip`。打包任务缺少签名凭据时会失败，普通构建和 `publishToMavenLocal` 不需要这些凭据。签名必须对应 ZIP 内的原始文件，签名完成后不要重建文件再上传。
 

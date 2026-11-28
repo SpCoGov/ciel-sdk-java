@@ -15,7 +15,7 @@ The only external runtime dependency is **Gson 2.14.0**. HTTP, WebSocket, TLS, a
 
 ## Installation
 
-Coordinates: `top.spco.ciel:ciel-sdk-java:0.2.0`.
+Coordinates: `top.spco.ciel:ciel-sdk-java:0.3.0`.
 
 For local use, install the SDK into **your local Maven repository**. The project also provides a signed bundle workflow for manual Maven Central upload; producing a bundle does not publish the artifact. See [Publishing to Maven Central](#publishing-to-maven-central).
 
@@ -36,7 +36,7 @@ repositories {
 }
 
 dependencies {
-    implementation("top.spco.ciel:ciel-sdk-java:0.2.0")
+    implementation("top.spco.ciel:ciel-sdk-java:0.3.0")
 }
 ```
 
@@ -51,7 +51,7 @@ Gradle resolves Gson transitively. JUnit is used only for the SDK's tests; appli
 3. Push the SDK source and workflow to the repository's default branch. Set the intended release version in `build.gradle.kts`, then select **Actions → Build Maven Central bundle → Run workflow**.
 4. Download `ciel-sdk-java-<version>-central.zip` from the run's **Artifacts** section. The upload action delivers the ZIP directly, without an additional outer ZIP. On Central Portal, choose **Publish Component**, upload this file, inspect validation results, and publish the validated deployment.
 
-The ZIP follows Maven repository layout, for example `top/spco/ciel/ciel-sdk-java/0.2.0/`. It contains the library, sources, Javadoc, POM, Gradle module metadata, PGP `.asc` signatures, and checksums. Gradle creates and checks the required files; the workflow also checks ZIP integrity. See the [Central upload requirements](https://central.sonatype.org/publish/publish-portal-upload/).
+The ZIP follows Maven repository layout, for example `top/spco/ciel/ciel-sdk-java/0.3.0/`. It contains the library, sources, Javadoc, POM, Gradle module metadata, PGP `.asc` signatures, and checksums. Gradle creates and checks the required files; the workflow also checks ZIP integrity. See the [Central upload requirements](https://central.sonatype.org/publish/publish-portal-upload/).
 
 The same task is available as `./gradlew centralBundle` (Windows: `.\gradlew.bat centralBundle`) when `SIGNING_KEY` and, if needed, `SIGNING_PASSWORD` are provided in the process environment. It generates `build/central-bundle/ciel-sdk-java-<version>-central.zip`. Missing signing credentials fail the bundle task; ordinary builds and `publishToMavenLocal` work without them. Never sign one set of files and upload rebuilt files: the signatures must match the exact bytes in the ZIP.
 
